@@ -12,11 +12,15 @@ import argparse
 from git import *
 import pymongo
 from subprocess import Popen, PIPE
+import json
 
 class Mongrate():
 
     MONGRATE_DB = 'admin'
     MONGRATE_STATUS_COLL = 'mongrate.status'
+    MONGRATE_HISTORY_COLL = 'mongrate.history'
+    MONGRATE_WORKING_SCRIPT_COLL = 'mongrate.scripts'
+    MONGRATE_HISTORY_SCRIPT_COLL = 'mongrate.history.scripts'
 
     def __init__(self, config, args, logger):
         self.config = config
@@ -52,12 +56,66 @@ class Mongrate():
 
     def migrate(self):
         """Migrate to/from the target git commit"""
+        mongo_status = self.__get_mongo_status()
+        if mongo_status['status'] == 'NOT MANAGED BY MONGRATE':
+            raise Exception('Cannot migrate: %s' % (mongo_status['status']))
+        change_list = self.get_git_changelist()
+        for change in change_list:
+            script = os.path.join(self.config['git'],change['file'])
+            if not self.DRY_RUN:
+                result = self.__load_script(script)
+            else:
+                self.logger.info("--dry-run: would have loaded %s" % script)
+                result = True
+            self.logger.debug("result from %s was %s" % (script, str(result)))
+
 
     def generate_template_migration(self):
         """Generate a template migration"""
 
     def test_run_script(self):
-        self.__run_script(self.args.test_script,self.args.test_script_func)
+        for script in self.args.test_script.split(','):
+            result = self.__load_script(script)
+            self.logger.debug("result from %s was %s" % (script, str(result)))
+
+    # git specific functions
+
+    # TODO: modify this to deal with tags, branches
+    # rather than just commit sha's
+    def get_git_changelist(self):
+        target_commit = self.args.git_commit
+        self.logger.info("__get_git_changelist target_commit=%s" % target_commit)
+        git_status = self.__get_git_status()
+        current_commit = git_status['commits'][0];
+        self.logger.debug("current_commit %s" % (str(current_commit)))
+        # validate we already have the target_commit
+        # if not, then we need to pull?
+        got_target = False
+        for commit in git_status['commits']:
+            if commit.id == target_commit:
+                self.logger.debug("found target commit=%s" % str(commit))
+                got_target = True
+        if not got_target:
+            m = "target commit %s was not found in repo commits" % (target_commit)
+            raise Exception(m)
+        repo = self.__get_git_repo()
+        if not target_commit == current_commit.id:
+            diff = repo.git.diff(target_commit,"--name-status").split('\n')
+        else:
+            diff = repo.git.show(target_commit,"--name-status","--oneline").split('\n')[1:]
+        self.logger.debug(diff)
+        change_list = []
+        for line in diff:
+            parts = line.split('\t')
+            self.logger.debug(parts)
+            # filter change list based on migration_home
+            if self.config['migration_home'] in parts[1]:
+                change_list.append( { "action" : parts[0], "file" : parts[1] } )
+            else:
+                m = "found change %s but was not under %s" % (str(parts),self.config['migration_home'])
+                self.logger.debug(m)
+        self.logger.debug(change_list)
+        return change_list
 
     def __get_git_status(self):
         git_status = {}
@@ -74,6 +132,8 @@ class Mongrate():
         if not hasattr(self,'repo'):
             self.repo = Repo( self.config['git'] )
         return self.repo
+
+    # end git specific functions
 
     # mongo specific functions
     def __get_mongo_status(self):
@@ -98,14 +158,22 @@ class Mongrate():
                 raise
         return self.mongo
 
-    def __run_script(self,script,func_to_call="info"):
+    # actually we should load each migration and save into
+    # temp collection, then we can sort and run in order
+    #
+    def __load_script(self,script):
         """Run a script as specified by the full path to the .js file return True if OK, False if Error"""
-        self.logger.info("__run_script called for '"+script+"'")
+        self.logger.debug("__load_script called for '"+script+"'")
         shell_args = []
         shell_args.append("mongo")
         # TODO: deal with auth creds given from mongrate args
         shell_args.append(self.config['mongodb'])
-        eval_string = "load('%s');migration.%s();" % (script,func_to_call)
+        eval_string = "mongrate = %s;" % (self.__get_mongrate_util_object(script))
+        eval_string += "db=db.getSiblingDB('%s');" % self.MONGRATE_DB
+        eval_string += "load('%s');" % (script)
+        #eval_string += "printjson(mongrate);"
+        eval_string += "eval('mongrate.tryLoad = ' + mongrate.tryLoad);"
+        eval_string += "mongrate.tryLoad();"
         shell_args.append("--eval")
         shell_args.append(eval_string)
         self.logger.debug("shell_args: %s" % (shell_args))
@@ -117,6 +185,68 @@ class Mongrate():
         else:
             self.logger.debug("Output from '%s' was '%s'" % (script, output))
             return True
+
+    def __get_mongrate_util_object(self,script):
+        if not hasattr(self,'mongrate'):
+            m = {}
+            m['migrations'] = []
+            m['migrations'].append(script)
+            m['mongodb'] = self.config['mongodb']
+            # not sure here, keep list of migrations?
+            # add some "site identifier" so migration
+            # implementation can check this
+            self.mongrate = {}
+            self.mongrate['meta'] = m
+        else:
+            self.mongrate['meta']['migrations'].append(script)
+
+        m = {}
+        # tryLoad will do checking on a given migration for required
+        # things, and then insert the migration into a collection for later processing
+        try_load="""function() {
+            if (Object.keys(mongrate).indexOf('exports')==-1) {
+                throw 'No exports property found on mongrate';
+            }
+            var p = Object.keys(mongrate.exports);
+            if (p.indexOf('_id')==-1) {
+                throw '%s missing _id';
+            }
+            if (p.indexOf('onLoad')!=-1) {
+                print('Calling onLoad for %s');
+                mongrate.exports.onLoad(this);
+            } else {
+                print('No onLoad found for %s');
+            }
+            var r = db.getSiblingDB('%s').getCollection('%s').insert(mongrate.exports);
+            if ( !r.ok ) {
+                throw r.getWriteError().errmsg;
+            }
+
+        }"""
+        try_load = try_load.replace('\"','')
+        m['tryLoad'] = try_load % (script,script,script,self.MONGRATE_DB,self.MONGRATE_WORKING_SCRIPT_COLL)
+        self.mongrate['tryLoad']=m['tryLoad']
+        return json.dumps(self.mongrate)
+
+    # generate JSON for mongrate state object
+    # which gets passed into each migration
+    # script, this is generated from a property
+    # so we can keep track of all the state
+    def __get_mongrate_state_object(self, script):
+        """Retuns a JSON string to initialize mongrate state object for migration"""
+        if not hasattr(self,'mongrate'):
+            m = {}
+            m['migrations'] = []
+            m['migrations'].append(script)
+            m['mongodb'] = self.mongodb
+            # not sure here, keep list of migrations?
+            # add some "site identifier" so migration
+            # implementation can check this
+            self.mongrate = {}
+            self.mongrate['meta'] = m
+        else:
+            self.mongrate['meta']['migrations'].append(script)
+        return json.dumps(self.mongrate)
 
     # end mongo specific functions
 
@@ -132,7 +262,7 @@ def main():
     parser.add_argument("-a","--action",default="status"
                         ,help='Action to perform. status, migrate, generate_migration, default is \'status\'')
     parser.add_argument("-f","--config",default="./mongrate.conf",help='Configuration file see docs')
-    parser.add_argument("--git-hash",help="git tag/branch/commit hash to migrate to")
+    parser.add_argument("--git-commit",help="git tag/branch/commit hash to migrate to")
     parser.add_argument("--dry-run",action='store_true',default=False
                         ,help='Only show what would have been done, don\'t actually do anything')
     parser.add_argument("--test-script",help='Internal testing use only')
