@@ -13,6 +13,8 @@ from git import *
 import pymongo
 from subprocess import Popen, PIPE
 import json
+import datetime
+from toposort import toposort, toposort_flatten
 
 class Mongrate():
 
@@ -54,21 +56,46 @@ class Mongrate():
         print "\nCurrent mongo status\n--------------------"
         print mongo_status
 
+    def initialize(self):
+        """Initialize a mongoDB instance to work with mongrate"""
+        self.logger.info('starting initialize action')
+        mongo_status = self.__get_mongo_status()
+        if not mongo_status['status'] == 'NOT MANAGED BY MONGRATE':
+            if not self.args.force:
+                raise Exception('Cannot initialize: %s' % (mongo_status['status']))
+            else:
+                self.logger.info('Mongo instance seems to be already inialized, but force=%s so continuing' % (str(self.args.force)))
+        self.__initialize_mongo_instance()
+        self.logger.info("mongoDB initialization complete")
+
     def migrate(self):
         """Migrate to/from the target git commit"""
         mongo_status = self.__get_mongo_status()
         if mongo_status['status'] == 'NOT MANAGED BY MONGRATE':
             raise Exception('Cannot migrate: %s' % (mongo_status['status']))
+        # get changes from git
+        # load them into mongo
+        self.__clean_stored_migrations()
         change_list = self.get_git_changelist()
+        loading_result = True
         for change in change_list:
             script = os.path.join(self.config['git'],change['file'])
             if not self.DRY_RUN:
                 result = self.__load_script(script)
+                loading_result = loading_result and  result
             else:
                 self.logger.info("--dry-run: would have loaded %s" % script)
                 result = True
             self.logger.debug("result from %s was %s" % (script, str(result)))
-
+        if not loading_result:
+            self.logger.info("Error encountered loading migrations. Please check logs and retry")
+            return
+        # figure out run order
+        sorted_scripts = self.__get_scripts_toposort()
+        self.logger.debug(sorted_scripts)
+        for script_set in sorted_scripts:
+            for script in script_set:
+                self.logger.debug("about to run script='%s'" % script)
 
     def generate_template_migration(self):
         """Generate a template migration"""
@@ -147,6 +174,29 @@ class Mongrate():
             mongo_status['status'] = list(mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].find())
         return mongo_status
 
+    def __initialize_mongo_instance(self):
+        """Initializes a mongoDB instance to work with mongrate"""
+        mongo = self.__get_mongo_client()
+        init_doc = { '_id' : 'INITIALIZE', 'ts' : datetime.datetime.now() }
+        try:
+            # TODO: should we backup any existing status data?
+            mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].drop()
+            wr = mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].insert_one(init_doc)
+        except Exception as exp:
+            self.logger.error(exp)
+            raise
+
+    def __update_mongo_status(message, script):
+        """Update status collection with info"""
+        mongo = self.__get_mongo_client()
+        status_doc = { 'ts' : datetime.datetime.now(), "msg" : message }
+        try:
+            wr = mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].insert_one(status_doc)
+        except Exception as exp:
+            self.logger.error(exp)
+            raise
+
+
     def __get_mongo_client(self):
         if not hasattr(self,'mongo'):
             # TODO: add in extra auth parameters here!
@@ -157,6 +207,27 @@ class Mongrate():
                 logger.error(exp)
                 raise
         return self.mongo
+
+    # this function fetchs the depedency info for the
+    # set of migrations to be run
+    # it then converts this into the format for the toposort
+    # library
+    # { 1 : { 2, 5 }, 5 : { 3, 7, 9 }, etc
+    # https://pypi.python.org/pypi/toposort/1.0
+    def __get_scripts_toposort(self):
+        """Fetch scripts and dependecies (runBefore) and sort them"""
+        mongo = self.__get_mongo_client()
+        data = list(mongo['admin']['mongrate.scripts'].find({},{'runBefore':1}))
+        self.logger.debug(data)
+        dt = {}
+        for d in data:
+            if not hasattr(d,'runBefore'):
+                d['runBefore']=[]
+            self.logger.debug(d)
+            dt[str(d['_id'])]={str(x) for x in d['runBefore']}
+        self.logger.debug(dt)
+        tsort = list(toposort(dt))
+        return tsort
 
     # actually we should load each migration and save into
     # temp collection, then we can sort and run in order
@@ -218,7 +289,7 @@ class Mongrate():
                 print('No onLoad found for %s');
             }
             var r = db.getSiblingDB('%s').getCollection('%s').insert(mongrate.exports);
-            if ( !r.ok ) {
+            if ( r.getWriteError() ) {
                 throw r.getWriteError().errmsg;
             }
 
@@ -227,6 +298,10 @@ class Mongrate():
         m['tryLoad'] = try_load % (script,script,script,self.MONGRATE_DB,self.MONGRATE_WORKING_SCRIPT_COLL)
         self.mongrate['tryLoad']=m['tryLoad']
         return json.dumps(self.mongrate)
+
+    def __clean_stored_migrations(self):
+        mongo = self.__get_mongo_client()
+        mongo[self.MONGRATE_DB][self.MONGRATE_WORKING_SCRIPT_COLL].drop()
 
     # generate JSON for mongrate state object
     # which gets passed into each migration
@@ -258,13 +333,16 @@ class Mongrate():
 
 def main():
     # parse arguments
-    parser = argparse.ArgumentParser()
+    description = u'mongrate - a MongoDB migration \U0001F528 \U0001F415 \U0001F3CB \U0001F3D1'
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("-a","--action",default="status"
                         ,help='Action to perform. status, migrate, generate_migration, default is \'status\'')
     parser.add_argument("-f","--config",default="./mongrate.conf",help='Configuration file see docs')
     parser.add_argument("--git-commit",help="git tag/branch/commit hash to migrate to")
     parser.add_argument("--dry-run",action='store_true',default=False
                         ,help='Only show what would have been done, don\'t actually do anything')
+    parser.add_argument("--force",action='store_true',default=False
+                        ,help='Force an action, override any internal checks')
     parser.add_argument("--test-script",help='Internal testing use only')
     parser.add_argument("--test-script-func",help='Internal testing use only')
     # TODO: add more command line options to allow setting security credentials for Mongo connection
@@ -280,6 +358,8 @@ def main():
         handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    logger.info(description)
+    logger.info('mongrate startup')
     logger.debug("args: " + str(args))
     logger.debug("config: " + str(config))
     logger.info("log level set to " + logging.getLevelName(logger.getEffectiveLevel()))
