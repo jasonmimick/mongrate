@@ -15,6 +15,7 @@ from subprocess import Popen, PIPE
 import json
 import datetime
 from toposort import toposort, toposort_flatten
+import uuid
 
 class Mongrate():
 
@@ -33,6 +34,10 @@ class Mongrate():
             self.DRY_RUN = True
         else:
             self.DRY_RUN = False
+        # TODO: move 'verbose' to args, not config, better to be able to turn on
+        # as needed
+        #if not hasattr(self.config['verbose']):
+        #    self.config['verbose']=False
 
     def act(self,action):
         """Perform the request action"""
@@ -43,6 +48,7 @@ class Mongrate():
             self.logger.debug("action '" + action + "' complete.")
         except Exception as exp:
             self.logger.error(exp)
+            print('verbose=%s' % str(self.config['verbose']))
             if self.config['verbose']:
                 raise
 
@@ -76,7 +82,8 @@ class Mongrate():
         # get changes from git
         # load them into mongo
         self.__clean_stored_migrations()
-        change_list = self.get_git_changelist()
+        rollback, change_list = self.get_git_changelist()
+        self.logger.info('migrate rollback=%s' % (str(rollback)))
         loading_result = True
         for change in change_list:
             script = os.path.join(self.config['git'],change['file'])
@@ -88,17 +95,85 @@ class Mongrate():
                 result = True
             self.logger.debug("result from %s was %s" % (script, str(result)))
         if not loading_result:
-            self.logger.info("Error encountered loading migrations. Please check logs and retry")
+            self.logger.info("Error encountered loading migrations). Please check logs and retry")
             return
         # figure out run order
         sorted_scripts = self.__get_scripts_toposort()
         self.logger.debug(sorted_scripts)
+        # TODO: if rollback need to run in reverse order!
+        # keep list of scripts we ran, if any errors
+        # call rollback in reverse order of how we ran
+        executed_scripts = []
+        undo = False
         for script_set in sorted_scripts:
+            if undo:
+                break
             for script in script_set:
-                self.logger.debug("about to run script='%s'" % script)
+                if undo:
+                    break
+                try:
+                    self.logger.debug("about to run script='%s' rollback=%s" % (script,str(rollback)))
+                    executed_scripts.append(script)
+                except Exception as exp:
+                    self.logger.error(exp)
+                    self.logger.error('Error during migration execution, going into undo mode')
+                    undo = True
+
+        if undo:
+            self.logger.info('starting undo of scripts=%s' % str(executed_scripts))
+            for script in executed_scripts:
+                self.logger.info('running undo (down()) for script=%s' % script)
+        else:
+            self.logger.info('migrations completed successfully, updating commit to %s' % self.args.git_commit)
+            self.__update_mongo_mongrate_commit(self.args.git_commit)
+            self.logger.info('migration complete')
 
     def generate_template_migration(self):
         """Generate a template migration"""
+        self.logger.info('generating template migration')
+        mig_id = self.args.migration_id
+        self.logger.info('template migration name = %s' % mig_id)
+        fname = self.args.migration_id + '.js'
+        script_filename = os.path.join(self.config['git'],self.config['migration_home'],fname)
+        self.logger.debug('script_filename=%s', script_filename)
+        if os.path.isfile(script_filename):
+            self.logger.error('detected %s already exists' % script_filename)
+            script_filename = script_filename + '.' + str(uuid.uuid4())
+            self.logger.info('updated script filename to %s' % script_filename)
+        t = open(script_filename,"w")
+        def write_line(fd,s):
+            fd.write(s)
+            fd.write('\n')
+        write_line(t,'/*************************')
+        write_line(t,'* MongoDB Migration')
+        write_line(t,'*')
+        write_line(t,'* Generated on '+str(datetime.datetime.now()))
+        write_line(t,'* _id : ' + mig_id)
+        write_line(t,'**************************/')
+        write_line(t,'')
+        write_line(t,'migration = {')
+        write_line(t,'  \'_id\' : \'' + mig_id + '\',')
+        write_line(t,'  \'runAfter\' : [],')
+        write_line(t,'  \'onLoad\' : function() {')
+        write_line(t,'      // TODO: Add onLoad logic here')
+        write_line(t,'      },')
+        write_line(t,'  \'up\' : function() {')
+        write_line(t,'      // TODO: rollforward logic')
+        write_line(t,'      },')
+        write_line(t,'  \'down\' : function() {')
+        write_line(t,'      // TODO: Add undo/rollback logic here')
+        write_line(t,'      },')
+        write_line(t,'  \'info\' : function() {')
+        write_line(t,'      // output information on this migration for reporting')
+        write_line(t,'      print(\'migration : \' + this._id)')
+        write_line(t,'      },')
+        write_line(t,'}')
+        write_line(t,'')
+        write_line(t,'mongrate.exports = migration;')
+        t.close()
+        self.logger.info('Template migration %s generated %s' % (mig_id, script_filename))
+        self.logger.info('migration generation complete')
+
 
     def test_run_script(self):
         for script in self.args.test_script.split(','):
@@ -110,6 +185,7 @@ class Mongrate():
     # TODO: modify this to deal with tags, branches
     # rather than just commit sha's
     def get_git_changelist(self):
+        rollback = False
         target_commit = self.args.git_commit
         self.logger.info("__get_git_changelist target_commit=%s" % target_commit)
         git_status = self.__get_git_status()
@@ -125,7 +201,16 @@ class Mongrate():
         if not got_target:
             m = "target commit %s was not found in repo commits" % (target_commit)
             raise Exception(m)
+        c = git_status['commits']
+        target_commit_index = [i for i in range(len(c)) if c[i].id==target_commit][0]
+        mongo_status = self.__get_mongo_status()
+        mongrate_commit = [s for s in mongo_status['status'] if s['_id']=='COMMIT'][0]['value']
+        current_mongrate_commit_index = [i for i in range(len(c)) if c[i].id==mongrate_commit][0]
+        if target_commit_index < current_mongrate_commit_index:
+            self.logger.info("Target commit before current commit, rollback = True")
+            rollback = True
         repo = self.__get_git_repo()
+        # roll forward
         if not target_commit == current_commit.id:
             diff = repo.git.diff(target_commit,"--name-status").split('\n')
         else:
@@ -142,7 +227,7 @@ class Mongrate():
                 m = "found change %s but was not under %s" % (str(parts),self.config['migration_home'])
                 self.logger.debug(m)
         self.logger.debug(change_list)
-        return change_list
+        return rollback, change_list
 
     def __get_git_status(self):
         git_status = {}
@@ -172,26 +257,49 @@ class Mongrate():
             mongo_status['status'] = "NOT MANAGED BY MONGRATE"
         else:
             mongo_status['status'] = list(mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].find())
+        # ensure required status docs are there
+        if not [s for s in mongo_status['status'] if s['_id']=='COMMIT']:
+            mongo_status.append({'_id':'COMMIT','value':0})
+
         return mongo_status
 
     def __initialize_mongo_instance(self):
         """Initializes a mongoDB instance to work with mongrate"""
+        self.logger.info("initializing status in MongoDB")
         mongo = self.__get_mongo_client()
-        init_doc = { '_id' : 'INITIALIZE', 'ts' : datetime.datetime.now() }
+        ts = datetime.datetime.now()
+        init_doc = { '_id' : 'INITIALIZE', 'ts' : ts }
         try:
             # TODO: should we backup any existing status data?
             mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].drop()
             wr = mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].insert_one(init_doc)
+            self.logger.debug('inserted status %s writeResult=%s' % (str(init_doc), str(wr)))
+            commit_doc = { '_id' : "COMMIT", 'value' : 0, 'ts' : ts }
+            wr = mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].insert_one(commit_doc)
+            self.logger.debug('inserted status %s writeResult=%s' % (str(commit_doc), str(wr)))
         except Exception as exp:
             self.logger.error(exp)
             raise
 
-    def __update_mongo_status(message, script):
+    def __update_mongo_mongrate_commit(self, commit):
+        """Update status collection with info"""
+        mongo = self.__get_mongo_client()
+        try:
+            q = { '_id' : 'COMMIT' }
+            u = { '$set' : { 'value' : commit } }
+            wr = mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].update_one(q,u)
+            self.logger.debug('update status %s %s writeResult=%s' % (str(q),str(u),str(wr)))
+        except Exception as exp:
+            self.logger.error(exp)
+            raise
+
+    def __update_mongo_status(self, message):
         """Update status collection with info"""
         mongo = self.__get_mongo_client()
         status_doc = { 'ts' : datetime.datetime.now(), "msg" : message }
         try:
             wr = mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].insert_one(status_doc)
+            self.logger.debug('inserted status %s writeResult=%s' % (status_doc, wr))
         except Exception as exp:
             self.logger.error(exp)
             raise
@@ -215,16 +323,17 @@ class Mongrate():
     # { 1 : { 2, 5 }, 5 : { 3, 7, 9 }, etc
     # https://pypi.python.org/pypi/toposort/1.0
     def __get_scripts_toposort(self):
-        """Fetch scripts and dependecies (runBefore) and sort them"""
+        """Fetch scripts and dependecies (runAfter) and sort them"""
         mongo = self.__get_mongo_client()
-        data = list(mongo['admin']['mongrate.scripts'].find({},{'runBefore':1}))
+        data = list(mongo['admin']['mongrate.scripts'].find({},{'runAfter':1}))
         self.logger.debug(data)
         dt = {}
         for d in data:
-            if not hasattr(d,'runBefore'):
-                d['runBefore']=[]
+            if not 'runAfter' in d:
+                d['runAfter']=[]
             self.logger.debug(d)
-            dt[str(d['_id'])]={str(x) for x in d['runBefore']}
+            dt[str(d['_id'])]={str(x) for x in d['runAfter']}
+        self.logger.debug('dt')
         self.logger.debug(dt)
         tsort = list(toposort(dt))
         return tsort
@@ -339,6 +448,7 @@ def main():
                         ,help='Action to perform. status, migrate, generate_migration, default is \'status\'')
     parser.add_argument("-f","--config",default="./mongrate.conf",help='Configuration file see docs')
     parser.add_argument("--git-commit",help="git tag/branch/commit hash to migrate to")
+    parser.add_argument("--migration-id",help="id of migration to generate template")
     parser.add_argument("--dry-run",action='store_true',default=False
                         ,help='Only show what would have been done, don\'t actually do anything')
     parser.add_argument("--force",action='store_true',default=False
