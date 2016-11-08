@@ -38,6 +38,7 @@ class Mongrate():
         # as needed
         #if not hasattr(self.config['verbose']):
         #    self.config['verbose']=False
+        self.decorate_mongo_connection_string()
 
     def act(self,action):
         """Perform the request action"""
@@ -244,10 +245,10 @@ class Mongrate():
         # run 'common' scripts and then optionally any scripts based upon
         # distributionCenter arg
         common_filter = os.path.join(self.config['migration_home'],self.config['migration_common_home'])
-        self.logger.info('Filtering chages based on migration home common folder=%s' % common_filter)
+        self.logger.info('Filtering changes based on migration home common folder=%s' % common_filter)
         if self.args.distributionCenter:
             dc = self.args.distributionCenter
-            self.logger.info('Found distributionCenter arg, running scripts for %s' % dc)
+            self.logger.info('Found distributionCenter arg, adding scripts for dc %s' % dc)
             d = os.path.join( self.config['migration_home'], dc)
             dc_filter = dc
         else:
@@ -348,10 +349,10 @@ class Mongrate():
         if not hasattr(self,'mongo'):
             # TODO: add in extra auth parameters here!
             try:
-                self.logger.debug("attempting connection MongoDB: " + self.config['mongodb'])
+                self.logger.debug("attempting connection MongoDB: " + self.config['masked_mongodb'])
                 self.mongo = pymongo.MongoClient(self.config['mongodb'])
             except Exception as exp:
-                logger.error(exp)
+                self.logger.error(exp)
                 raise
         return self.mongo
 
@@ -360,23 +361,24 @@ class Mongrate():
         got_user = self.args.user
         got_pwd = self.args.password
         need_to_fix_uri = False
-        if got_user:
+        if self.args.user:
             self.logger.debug('got_user was True, attempting to fix MongoDB URI')
             need_to_fix_uri = True
-        if got_pwd:
+        if self.args.password:
             self.logger.debug('got_pwd was True, attempting to fix MongoDB URI')
             need_to_fix_uri = True
         if not need_to_fix_uri:
             self.logger.debug('don\'t need to fix MongoDB URI')
+            self.config['masked_mongodb']=self.config['mongodb']
             return
         cs = self.config['mongodb']
         self.config['original.mongodb'] = cs    # save off just in case
         parsed_cs = pymongo.uri_parser.parse_uri(cs)
         self.logger.debug('1 parsed_cs=%s' % parsed_cs)
-        if got_user:
+        if self.args.user:
             parsed_cs['username']=self.args.user
             self.logger.debug('updated MongoDB URI with username from args')
-        if got_pwd:
+        if self.args.password:
             parsed_cs['password']=self.args.password
             self.logger.debug('updated MongoDB URI with password from args')
         self.logger.debug('parsed_cs=%s' % parsed_cs)
@@ -390,11 +392,19 @@ class Mongrate():
             ncs += '%s?' % parsed_cs['database']
         if self.args.authenticationDatabase:
             parsed_cs['options']['authSource']=self.args.authenticationDatabase
+            self.logger.debug('updated MongoDB URI with authSource from authenticationDatabase argument')
         for k in parsed_cs['options']:
             ncs += '%s=%s&' % (k,parsed_cs['options'][k])
         ncs = ncs[:-1]      # trim trailing &
         self.config['mongodb']=ncs
-        self.logger.debug('mongodb=%s' % self.config['mongodb'])
+        # mask password for any logging
+        if len(self.config['mongodb'].split('@'))>0:
+            parts = self.config['mongodb'].split('@')
+            b = parts[0].split(':')
+            b[2]="XXXXXXXXX"
+            self.config['masked_mongodb']=':'.join(b)+'@'+parts[1]
+
+        self.logger.debug('mongodb=%s' % self.config['masked_mongodb'])
 
     # this function fetchs the depedency info for the
     # set of migrations to be run
