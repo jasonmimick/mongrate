@@ -48,8 +48,7 @@ class Mongrate():
             self.logger.debug("action '" + action + "' complete.")
         except Exception as exp:
             self.logger.error(exp)
-            print('verbose=%s' % str(self.config['verbose']))
-            if self.config['verbose']:
+            if self.args.verbose:
                 raise
 
     def status(self):
@@ -95,37 +94,51 @@ class Mongrate():
                 result = True
             self.logger.debug("result from %s was %s" % (script, str(result)))
         if not loading_result:
-            self.logger.info("Error encountered loading migrations). Please check logs and retry")
+            self.logger.info("Error encountered loading migrations. Please check logs and retry")
             return
         # figure out run order
-        sorted_scripts = self.__get_scripts_toposort()
+        sorted_scripts = self.__get_scripts_toposort(rollback)
         self.logger.debug(sorted_scripts)
         # TODO: if rollback need to run in reverse order!
         # keep list of scripts we ran, if any errors
         # call rollback in reverse order of how we ran
         executed_scripts = []
         undo = False
-        for script_set in sorted_scripts:
+        running_result = True
+        for script in sorted_scripts:
             if undo:
                 break
-            for script in script_set:
-                if undo:
-                    break
-                try:
-                    self.logger.debug("about to run script='%s' rollback=%s" % (script,str(rollback)))
-                    executed_scripts.append(script)
-                except Exception as exp:
-                    self.logger.error(exp)
-                    self.logger.error('Error during migration execution, going into undo mode')
-                    undo = True
+            try:
+                self.logger.debug("about to run script='%s' rollback=%s" % (script,str(rollback)))
+                if not self.DRY_RUN:
+                    result = self.__run_script(script,rollback)
+                    running_result = running_result and  result
+                else:
+                    self.logger.info("--dry-run: would have run %s" % script)
+                    result = True
+                self.logger.debug("result from %s was %s" % (script, str(result)))
+                executed_scripts.append(script)
+            except Exception as exp:
+                self.logger.error(exp)
+                self.logger.error('Error during migration execution, going into undo mode')
+                undo = True
 
         if undo:
             self.logger.info('starting undo of scripts=%s' % str(executed_scripts))
-            for script in executed_scripts:
+            # TODO: need to undo in reverse order
+            ex = executed_scripts[:]
+            ex.reverse()
+            for script in ex:
                 self.logger.info('running undo (down()) for script=%s' % script)
+                if not self.DRY_RUN:
+                    result = self.__run_script(script,not rollback)
+                else:
+                    self.logger.info("--dry-run: would have run %s" % script)
+                    result = True
+                self.logger.debug("undo result from %s was %s" % (script, str(result)))
         else:
-            self.logger.info('migrations completed successfully, updating commit to %s' % self.args.git_commit)
-            self.__update_mongo_mongrate_commit(self.args.git_commit)
+            #self.logger.info('migrations completed successfully, updating commit to %s' % self.args.git_commit)
+            #self.__update_mongo_mongrate_commit(self.args.git_commit)
             self.logger.info('migration complete')
 
     def generate_template_migration(self):
@@ -159,9 +172,11 @@ class Mongrate():
         write_line(t,'      },')
         write_line(t,'  \'up\' : function() {')
         write_line(t,'      // TODO: rollforward logic')
+        write_line(t,'      // TODO: Be sure do \'use\' right right database!')
         write_line(t,'      },')
         write_line(t,'  \'down\' : function() {')
         write_line(t,'      // TODO: Add undo/rollback logic here')
+        write_line(t,'      // TODO: Be sure do \'use\' right right database!')
         write_line(t,'      },')
         write_line(t,'  \'info\' : function() {')
         write_line(t,'      // output information on this migration for reporting')
@@ -205,8 +220,15 @@ class Mongrate():
         target_commit_index = [i for i in range(len(c)) if c[i].id==target_commit][0]
         mongo_status = self.__get_mongo_status()
         mongrate_commit = [s for s in mongo_status['status'] if s['_id']=='COMMIT'][0]['value']
+        self.logger.debug('mongrate_commit = %s' % mongrate_commit)
         current_mongrate_commit_index = [i for i in range(len(c)) if c[i].id==mongrate_commit][0]
-        if target_commit_index < current_mongrate_commit_index:
+        self.logger.debug('current_mongrate_commit_index=%s' % current_mongrate_commit_index)
+        self.logger.debug('target_commit_index=%s' % target_commit_index)
+        #commit list is in reverse order
+        #recent commits, then older ones
+        #so, if the index of the target commit is greater
+        # than the index of where we currently are, then it's a rollback
+        if target_commit_index > current_mongrate_commit_index:
             self.logger.info("Target commit before current commit, rollback = True")
             rollback = True
         repo = self.__get_git_repo()
@@ -217,11 +239,28 @@ class Mongrate():
             diff = repo.git.show(target_commit,"--name-status","--oneline").split('\n')[1:]
         self.logger.debug(diff)
         change_list = []
+
+        # filter change list based on migration_home
+        # run 'common' scripts and then optionally any scripts based upon
+        # distributionCenter arg
+        common_filter = os.path.join(self.config['migration_home'],self.config['migration_common_home'])
+        self.logger.info('Filtering chages based on migration home common folder=%s' % common_filter)
+        if self.args.distributionCenter:
+            dc = self.args.distributionCenter
+            self.logger.info('Found distributionCenter arg, running scripts for %s' % dc)
+            d = os.path.join( self.config['migration_home'], dc)
+            dc_filter = dc
+        else:
+            dc_filter = None
+        self.logger.debug('common_filter=%s dc_filter=%s' % (common_filter,dc_filter))
         for line in diff:
             parts = line.split('\t')
             self.logger.debug(parts)
-            # filter change list based on migration_home
-            if self.config['migration_home'] in parts[1]:
+            add_file = False
+            add_file = common_filter in parts[1]
+            if dc_filter and dc_filter in parts[1]:
+                add_file = True
+            if add_file:
                 change_list.append( { "action" : parts[0], "file" : parts[1] } )
             else:
                 m = "found change %s but was not under %s" % (str(parts),self.config['migration_home'])
@@ -316,13 +355,55 @@ class Mongrate():
                 raise
         return self.mongo
 
+    def decorate_mongo_connection_string(self):
+        """Adds in any runtime auth args to the connection string in the conf file."""
+        got_user = self.args.user
+        got_pwd = self.args.password
+        need_to_fix_uri = False
+        if got_user:
+            self.logger.debug('got_user was True, attempting to fix MongoDB URI')
+            need_to_fix_uri = True
+        if got_pwd:
+            self.logger.debug('got_pwd was True, attempting to fix MongoDB URI')
+            need_to_fix_uri = True
+        if not need_to_fix_uri:
+            self.logger.debug('don\'t need to fix MongoDB URI')
+            return
+        cs = self.config['mongodb']
+        self.config['original.mongodb'] = cs    # save off just in case
+        parsed_cs = pymongo.uri_parser.parse_uri(cs)
+        self.logger.debug('1 parsed_cs=%s' % parsed_cs)
+        if got_user:
+            parsed_cs['username']=self.args.user
+            self.logger.debug('updated MongoDB URI with username from args')
+        if got_pwd:
+            parsed_cs['password']=self.args.password
+            self.logger.debug('updated MongoDB URI with password from args')
+        self.logger.debug('parsed_cs=%s' % parsed_cs)
+        ncs = 'mongodb://'
+        ncs += '%s:' % parsed_cs['username']
+        ncs += '%s@' % parsed_cs['password']
+        for n in parsed_cs['nodelist']:
+            ncs += '%s:%s,' % (n[0],n[1])
+        ncs = ncs[:-1] + '/'  #replace last comma with forward slash
+        if parsed_cs['database']:
+            ncs += '%s?' % parsed_cs['database']
+        if self.args.authenticationDatabase:
+            parsed_cs['options']['authSource']=self.args.authenticationDatabase
+        for k in parsed_cs['options']:
+            ncs += '%s=%s&' % (k,parsed_cs['options'][k])
+        ncs = ncs[:-1]      # trim trailing &
+        self.config['mongodb']=ncs
+        self.logger.debug('mongodb=%s' % self.config['mongodb'])
+
     # this function fetchs the depedency info for the
     # set of migrations to be run
     # it then converts this into the format for the toposort
     # library
     # { 1 : { 2, 5 }, 5 : { 3, 7, 9 }, etc
+    # flatten = [ 1,2,5,3,7,9 ]
     # https://pypi.python.org/pypi/toposort/1.0
-    def __get_scripts_toposort(self):
+    def __get_scripts_toposort(self,rollback=False):
         """Fetch scripts and dependecies (runAfter) and sort them"""
         mongo = self.__get_mongo_client()
         data = list(mongo['admin']['mongrate.scripts'].find({},{'runAfter':1}))
@@ -331,11 +412,11 @@ class Mongrate():
         for d in data:
             if not 'runAfter' in d:
                 d['runAfter']=[]
-            self.logger.debug(d)
+            #self.logger.debug(d)
             dt[str(d['_id'])]={str(x) for x in d['runAfter']}
-        self.logger.debug('dt')
-        self.logger.debug(dt)
-        tsort = list(toposort(dt))
+        tsort = toposort_flatten(dt)
+        if rollback:
+            tsort.reverse()
         return tsort
 
     # actually we should load each migration and save into
@@ -348,7 +429,7 @@ class Mongrate():
         shell_args.append("mongo")
         # TODO: deal with auth creds given from mongrate args
         shell_args.append(self.config['mongodb'])
-        eval_string = "mongrate = %s;" % (self.__get_mongrate_util_object(script))
+        eval_string = "mongrate = %s;" % (self.__get_mongrate_util_object_on_load(script))
         eval_string += "db=db.getSiblingDB('%s');" % self.MONGRATE_DB
         eval_string += "load('%s');" % (script)
         #eval_string += "printjson(mongrate);"
@@ -366,7 +447,31 @@ class Mongrate():
             self.logger.debug("Output from '%s' was '%s'" % (script, output))
             return True
 
-    def __get_mongrate_util_object(self,script):
+    def __run_script(self,script,rollback=False):
+        """Run the up() or down() function of a script based on the _id of the migration, return True if OK, False if Error"""
+        self.logger.debug("__run_script called for '"+script+"'")
+        shell_args = []
+        shell_args.append("mongo")
+        # TODO: deal with auth creds given from mongrate args
+        shell_args.append(self.config['mongodb'])
+        eval_string = "mongrate = %s;" % (self.__get_mongrate_util_object_up_or_down(script,rollback))
+        #eval_string += "db=db.getSiblingDB('%s');" % self.MONGRATE_DB
+        #eval_string += "load('%s');" % (script)
+        #eval_string += "printjson(mongrate);"
+        eval_string += "eval('mongrate.tryFunc = ' + mongrate.tryFunc);"
+        eval_string += "mongrate.tryFunc();"
+        shell_args.append("--eval")
+        shell_args.append(eval_string)
+        self.logger.debug("shell_args: %s" % (shell_args))
+        proc = Popen(shell_args, stdout=PIPE, stderr=PIPE)
+        output, error = proc.communicate()
+        if proc.returncode != 0:
+            self.logger.error("Error running script '%s' output:'%s' error: '%s'" % (script, output, error))
+            return False
+        else:
+            self.logger.debug("Output from '%s' was '%s'" % (script, output))
+            return True
+    def __get_mongrate_util_object_on_load(self,script):
         if not hasattr(self,'mongrate'):
             m = {}
             m['migrations'] = []
@@ -406,6 +511,46 @@ class Mongrate():
         try_load = try_load.replace('\"','')
         m['tryLoad'] = try_load % (script,script,script,self.MONGRATE_DB,self.MONGRATE_WORKING_SCRIPT_COLL)
         self.mongrate['tryLoad']=m['tryLoad']
+        return json.dumps(self.mongrate)
+
+    def __get_mongrate_util_object_up_or_down(self,script,rollback=False):
+        if not hasattr(self,'mongrate'):
+            m = {}
+            m['migrations'] = []
+            m['migrations'].append(script)
+            m['mongodb'] = self.config['mongodb']
+            # not sure here, keep list of migrations?
+            # add some "site identifier" so migration
+            # implementation can check this
+            self.mongrate = {}
+            self.mongrate['meta'] = m
+        else:
+            self.mongrate['meta']['migrations'].append(script)
+
+        m = {}
+        # do same for up() and down() build wrapper try_ methods
+        try_func ="""function() {
+            var mig = db.getSiblingDB('%s').getCollection('%s').findOne( { '_id' : '%s' } );
+            if ( mig==undefined ) {
+                throw 'Unable to find script with _id = \\'%s\\' in db.%s.%s';
+            }
+            try {
+                print('Calling %s() for %s');
+                mig.%s();
+                print('%s() for %s complete');
+            } catch(error) {
+                print(error);
+                throw error
+            }
+        }"""
+        func = 'up'
+        if rollback:
+            func = 'down'
+        try_func = try_func.replace('\"','')
+        d = self.MONGRATE_DB
+        c = self.MONGRATE_WORKING_SCRIPT_COLL
+        m['tryFunc'] = try_func % (d,c,script,script,d,c,func,script,func,func,script)
+        self.mongrate['tryFunc']=m['tryFunc']
         return json.dumps(self.mongrate)
 
     def __clean_stored_migrations(self):
@@ -448,11 +593,17 @@ def main():
                         ,help='Action to perform. status, migrate, generate_migration, default is \'status\'')
     parser.add_argument("-f","--config",default="./mongrate.conf",help='Configuration file see docs')
     parser.add_argument("--git-commit",help="git tag/branch/commit hash to migrate to")
+    parser.add_argument("--distributionCenter",help="name of distribution center folder to run along with common migrations")
     parser.add_argument("--migration-id",help="id of migration to generate template")
+    parser.add_argument("-u","--user",help="user name for MongoDB connection, overrides conf connection string")
+    parser.add_argument("-p","--password",help="password for MongoDB connection, overrides conf connection string")
+    parser.add_argument("--authenticationDatabase",help="user source, --user and --password are required for this argument to be applied")
     parser.add_argument("--dry-run",action='store_true',default=False
                         ,help='Only show what would have been done, don\'t actually do anything')
     parser.add_argument("--force",action='store_true',default=False
                         ,help='Force an action, override any internal checks')
+    parser.add_argument("--verbose",action='store_true',default=False
+                        ,help='Enable more verbose logging')
     parser.add_argument("--test-script",help='Internal testing use only')
     parser.add_argument("--test-script-func",help='Internal testing use only')
     # TODO: add more command line options to allow setting security credentials for Mongo connection
