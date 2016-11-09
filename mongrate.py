@@ -45,8 +45,9 @@ class Mongrate():
         try:
             self.logger.debug("got request for action '"+action+"'")
             act = getattr(self,action)
-            act()
-            self.logger.debug("action '" + action + "' complete.")
+            ret = act()
+            self.logger.debug('action \'%s\' complete. ret=%s' % (action,ret))
+	    return ret
         except Exception as exp:
             self.logger.error(exp)
             if self.args.verbose:
@@ -61,6 +62,7 @@ class Mongrate():
         mongo_status = self.__get_mongo_status()
         print "\nCurrent mongo status\n--------------------"
         print mongo_status
+	return True
 
     def initialize(self):
         """Initialize a mongoDB instance to work with mongrate"""
@@ -73,6 +75,7 @@ class Mongrate():
                 self.logger.info('Mongo instance seems to be already inialized, but force=%s so continuing' % (str(self.args.force)))
         self.__initialize_mongo_instance()
         self.logger.info("mongoDB initialization complete")
+	return True
 
     def migrate(self):
         """Migrate to/from the target git commit"""
@@ -96,7 +99,7 @@ class Mongrate():
             self.logger.debug("result from %s was %s" % (script, str(result)))
         if not loading_result:
             self.logger.info("Error encountered loading migrations. Please check logs and retry")
-            return
+            return False
         # figure out run order
         sorted_scripts = self.__get_scripts_toposort(rollback)
         self.logger.debug(sorted_scripts)
@@ -141,6 +144,7 @@ class Mongrate():
             #self.logger.info('migrations completed successfully, updating commit to %s' % self.args.git_commit)
             #self.__update_mongo_mongrate_commit(self.args.git_commit)
             self.logger.info('migration complete')
+	return True
 
     def generate_template_migration(self):
         """Generate a template migration"""
@@ -148,7 +152,10 @@ class Mongrate():
         mig_id = self.args.migration_id
         self.logger.info('template migration name = %s' % mig_id)
         fname = self.args.migration_id + '.js'
-        script_filename = os.path.join(self.config['git'],self.config['migration_home'],fname)
+	# TODO: generate does NOT support distibution center 
+	# specific scripts - just generates in the 'common' folder
+	script_common_dir = os.path.join(self.config['migration_home'],self.config['migration_common_home'])
+        script_filename = os.path.join(self.config['git'],script_common_dir,fname)
         self.logger.debug('script_filename=%s', script_filename)
         if os.path.isfile(script_filename):
             self.logger.error('detected %s already exists' % script_filename)
@@ -189,6 +196,7 @@ class Mongrate():
         t.close()
         self.logger.info('Template migration %s generated %s' % (mig_id, script_filename))
         self.logger.info('migration generation complete')
+	return True
 
 
     def test_run_script(self):
@@ -217,12 +225,19 @@ class Mongrate():
         if not got_target:
             m = "target commit %s was not found in repo commits" % (target_commit)
             raise Exception(m)
+        #if target_commit==str(current_commit):
+        #    self.logger.info("Target commit equal to current commit, nothing to do")
+        #    return rollback, []
         c = git_status['commits']
         target_commit_index = [i for i in range(len(c)) if c[i].id==target_commit][0]
+        self.logger.debug('target_commit_index=%s' % target_commit_index)
         mongo_status = self.__get_mongo_status()
         mongrate_commit = [s for s in mongo_status['status'] if s['_id']=='COMMIT'][0]['value']
         self.logger.debug('mongrate_commit = %s' % mongrate_commit)
-        current_mongrate_commit_index = [i for i in range(len(c)) if c[i].id==mongrate_commit][0]
+        if not mongrate_commit == 0:
+            current_mongrate_commit_index = [i for i in range(len(c)) if c[i].id==mongrate_commit][0]
+        else:
+            current_mongrate_commit_index = 0
         self.logger.debug('current_mongrate_commit_index=%s' % current_mongrate_commit_index)
         self.logger.debug('target_commit_index=%s' % target_commit_index)
         #commit list is in reverse order
@@ -297,9 +312,9 @@ class Mongrate():
             mongo_status['status'] = "NOT MANAGED BY MONGRATE"
         else:
             mongo_status['status'] = list(mongo[self.MONGRATE_DB][self.MONGRATE_STATUS_COLL].find())
-        # ensure required status docs are there
-        if not [s for s in mongo_status['status'] if s['_id']=='COMMIT']:
-            mongo_status.append({'_id':'COMMIT','value':0})
+            # ensure required status docs are there
+            if not [s for s in mongo_status['status'] if s['_id']=='COMMIT']:
+                mongo_status.append({'_id':'COMMIT','value':0})
 
         return mongo_status
 
@@ -637,8 +652,19 @@ def main():
     logger.info("--dry-run is " + str(args.dry_run))
     mongrate = Mongrate(config, args, logger)
     logger.info('Mongrate initialized, attempt to perform ' + args.action + ' action')
-    mongrate.act(args.action)
-
+    try:
+    	ret = mongrate.act(args.action)
+	logger.debug('ret=%s' % str(ret))
+	if ret:
+	    logger.debug("going to call sys.exit(0)")
+	    sys.exit(0)
+	else:
+	    logger.debug("going to call sys.exit(1)")
+	    sys.exit(1)
+    except Exception as exp:
+	logger.error(exp)
+	logger.debug("got exception going to call sys.exit(1)")
+	sys.exit(1)
 if __name__ == '__main__':
     main()
 
